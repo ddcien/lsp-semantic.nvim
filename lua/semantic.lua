@@ -105,7 +105,7 @@ M.update_client_capabilities = function(client_capabilities)
         },
         formats = { 'relative' },
         overlappingTokenSupport = false,
-        multilineTokenSupport = true,
+        multilineTokenSupport = false,
         serverCancelSupport = false,
         augmentsSyntaxTokens = false,
     }
