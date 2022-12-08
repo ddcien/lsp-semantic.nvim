@@ -2,6 +2,11 @@ local util = require('vim.lsp.util')
 local bit = require("bit")
 local api = vim.api
 
+local config = {
+    refresh_on_change = true,
+    debounce = 400,
+    priority = 200,
+}
 local M = {}
 local active_refreshes = {}
 
@@ -25,36 +30,6 @@ local namespaces = setmetatable({}, {
 
 ---@private
 M.__namespaces = namespaces
-
-
---- Convert UTF index to `encoding` index.
---- Convenience wrapper around vim.str_byteindex
----Alternative to vim.str_byteindex that takes an encoding.
----@param line string line to be indexed
----@param index number UTF index
----@param encoding string utf-8|utf-16|utf-32|nil defaults to utf-16
----@return number byte (utf-8) index of `encoding` index `index` in `line`
-local function _safe_str_byteindex_enc(line, index, encoding)
-    if index == 0 or encoding == 'utf-8' then
-        return index
-    end
-    local ok, ret = pcall(util._str_byteindex_enc, line, index, encoding)
-    if ok then
-        return ret
-    end
-    return -1
-
-end
-
-local function get_line_byte_from_position(bufnr, row, col_start, col_end, offset_encoding)
-    if col_start == 0 and col_end == 0 then
-        return row, 0, 0
-    end
-    local line = api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
-    col_start = col_start and _safe_str_byteindex_enc(line, col_start, offset_encoding)
-    col_end = col_end and _safe_str_byteindex_enc(line, col_end, offset_encoding)
-    return row, col_start, col_end
-end
 
 M.update_client_capabilities = function(client_capabilities)
     client_capabilities = client_capabilities or vim.lsp.protocol.make_client_capabilities()
@@ -113,7 +88,6 @@ M.update_client_capabilities = function(client_capabilities)
     return client_capabilities
 end
 
----@private
 local on_semantic_apply_edit = function(data, edit)
     local j = 1
     local new_data = edit.data
@@ -143,11 +117,53 @@ function M.__semantic_to_hl_group(tt, tms, tokenTypes, tokenModifiers)
     return table.concat(hl_group, ".")
 end
 
+
+local function __safe_str_byteindex_enc(line, index, encoding)
+    if index == 0 or encoding == 'utf-8' then
+        return index
+    end
+    local ok, ret = pcall(util._str_byteindex_enc, line, index, encoding)
+    if ok then
+        return ret
+    end
+    return -1
+
+end
+
+local function __get_parameters(bufnr, row, col_start, col_end, hl, offset_encoding)
+    if col_start > 0 or col_end > 0 then
+        local line = api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
+        col_start = col_start and __safe_str_byteindex_enc(line, col_start, offset_encoding)
+        col_end = col_end and __safe_str_byteindex_enc(line, col_end, offset_encoding)
+    end
+    return row, col_start, {
+        end_col = col_end,
+        hl_group = hl,
+        priority = config.priority,
+    }
+end
+
+
+local function _add_highlight(bufnr, ns_id, line, col_start, length, hl, offset_encoding)
+    api.nvim_buf_set_extmark(
+        bufnr,
+        ns_id,
+        __get_parameters(
+            bufnr,
+            line,
+            col_start,
+            col_start + length,
+            hl,
+            offset_encoding
+        )
+    )
+end
+
 ---@private
 function M._on_semantic_parse(data, legend, bufnr, client_id, offset_encoding)
     local line = 0;
     local col_start = 0;
-    local ns = namespaces[client_id]
+    local ns_id = namespaces[client_id]
 
     local parse_and_add_highlight = function(deltaLine, deltaStartChar, length, tokenType, tokenModifiers)
         if deltaLine ~= 0 then
@@ -155,18 +171,14 @@ function M._on_semantic_parse(data, legend, bufnr, client_id, offset_encoding)
         end
         line = line + deltaLine
         col_start = col_start + deltaStartChar
-
-        api.nvim_buf_add_highlight(
-            bufnr,
-            ns,
+        _add_highlight(bufnr, ns_id, line, col_start, length,
             M.__semantic_to_hl_group(tokenType, tokenModifiers, legend.tokenTypes, legend.tokenModifiers),
-            get_line_byte_from_position(bufnr, line, col_start, col_start + length, offset_encoding)
-        )
+            offset_encoding)
     end
 
-    api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
+    api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
     for i = 1, #data, 5 do
-        parse_and_add_highlight(data[i], data[i + 1], data[i + 2], data[i + 3], data[i + 4])
+        pcall(parse_and_add_highlight, data[i], data[i + 1], data[i + 2], data[i + 3], data[i + 4])
     end
 end
 
@@ -180,20 +192,15 @@ function M._on_semantic(semantic, bufnr, client, legend)
         semantic_by_client = { [client_id] = semantic }
         semantic_cache_by_buf[bufnr] = semantic_by_client
 
-        local ns = namespaces[client_id]
         api.nvim_buf_attach(bufnr, false, {
             on_detach = function(b)
                 semantic_cache_by_buf[b] = nil
             end,
-            on_lines = function(_, b, changedtick, first_lnum, last_lnum, last_lnum_new)
-                if (last_lnum_new >= last_lnum) then
-                    M.refresh_buf_client_defer(client, b, changedtick, 200)
-                else
-                    api.nvim_buf_clear_namespace(b, ns, first_lnum, last_lnum)
-                end
+            on_lines = function(_, b, changedtick)
+                M.refresh_buf_client_defer(client, b, changedtick)
             end,
             on_changedtick = function(_, b, changedtick)
-                M.refresh_buf_client_defer(client, b, changedtick, 200)
+                M.refresh_buf_client_defer(client, b, changedtick)
             end
         })
         semantic_info = semantic
@@ -226,8 +233,10 @@ function M.refresh_buf_client(client, bufnr, changedtick)
 end
 
 ---@private
-function M.refresh_buf_client_defer(client, bufnr, changedtick, timeout)
-    vim.defer_fn(function() M.refresh_buf_client(client, bufnr, changedtick) end, timeout)
+function M.refresh_buf_client_defer(client, bufnr, changedtick)
+    if config.refresh_on_change then
+        vim.defer_fn(function() M.refresh_buf_client(client, bufnr, changedtick) end, config.debounce)
+    end
 end
 
 ---@private
@@ -279,6 +288,25 @@ function M.refresh()
     end
 end
 
+function M.setup(opt)
+
+    if not opt then
+        return
+    end
+
+    if opt.debounce then
+        config.debounce = opt.debounce
+    end
+
+    if opt.priority then
+        config.priority = opt.priority
+    end
+
+    if type(opt.refresh_on_change) == "boolean" then
+        config.refresh_on_change = opt.refresh_on_change
+    end
+end
+
 function M.show()
     local bufnr = api.nvim_get_current_buf()
     local start = api.nvim_win_get_cursor(0)
@@ -295,6 +323,7 @@ function M.show()
             { limit = 1, details = true }
         )[1]
         if ext_mark then
+            print(vim.inspect(ext_mark))
             local m_lnum = ext_mark[2]
             local m_col_start = ext_mark[3]
             local m_col_end = ext_mark[4].end_col
