@@ -10,6 +10,9 @@ local config = {
 local M = {}
 local active_refreshes = {}
 
+-- Dict[bufnr, Dict[ns_id, Dict[ext_id: ext_mark_userdata]]]
+local extmark_userdata = {}
+
 --- bufnr -> client_id -> semantices
 -- Dict[bufnr, Dict[client_id, semantices]]
 local semantic_cache_by_buf = setmetatable({}, {
@@ -103,20 +106,28 @@ local on_semantic_apply_edit = function(data, edit)
 end
 
 ---@private
-function M.__semantic_to_hl_group(tt, tms, tokenTypes, tokenModifiers)
-    local hl_group = { '@' .. tokenTypes[tt + 1] }
+function M.__semantic_to_hl_group(token_type, token_modifiers)
+    local hl_group = '@' .. token_type
+    for _, tm in ipairs(token_modifiers) do
+        hl_group = hl_group .. '.' .. tm
+    end
+    return hl_group
+end
+
+---@private
+local function token_modifiers_parse(tms, tokenModifiers)
+    local ret = {}
     local idx = 1
 
     while tms ~= 0 do
         if bit.band(tms, 1) ~= 0 then
-            table.insert(hl_group, tokenModifiers[idx])
+            table.insert(ret, tokenModifiers[idx])
         end
         tms = bit.rshift(tms, 1)
         idx = idx + 1
     end
-    return table.concat(hl_group, ".")
+    return ret
 end
-
 
 local function __safe_str_byteindex_enc(line, index, encoding)
     if index == 0 or encoding == 'utf-8' then
@@ -130,40 +141,13 @@ local function __safe_str_byteindex_enc(line, index, encoding)
 
 end
 
-local function __get_parameters(bufnr, row, col_start, col_end, hl, offset_encoding)
-    if col_start > 0 or col_end > 0 then
-        local line = api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
-        col_start = col_start and __safe_str_byteindex_enc(line, col_start, offset_encoding)
-        col_end = col_end and __safe_str_byteindex_enc(line, col_end, offset_encoding)
-    end
-    return row, col_start, {
-        end_col = col_end,
-        hl_group = hl,
-        priority = config.priority,
-    }
-end
-
-
-local function _add_highlight(bufnr, ns_id, line, col_start, length, hl, offset_encoding)
-    api.nvim_buf_set_extmark(
-        bufnr,
-        ns_id,
-        __get_parameters(
-            bufnr,
-            line,
-            col_start,
-            col_start + length,
-            hl,
-            offset_encoding
-        )
-    )
-end
-
 ---@private
-function M._on_semantic_parse(data, legend, bufnr, client_id, offset_encoding)
+function M._on_semantic_parse(data, legend, bufnr, client)
     local line = 0;
     local col_start = 0;
-    local ns_id = namespaces[client_id]
+    local offset_encoding = client.offset_encoding
+    local ns_id = namespaces[client.id]
+    local ext_mark_userdata_dict = {}
 
     local parse_and_add_highlight = function(deltaLine, deltaStartChar, length, tokenType, tokenModifiers)
         if deltaLine ~= 0 then
@@ -171,15 +155,38 @@ function M._on_semantic_parse(data, legend, bufnr, client_id, offset_encoding)
         end
         line = line + deltaLine
         col_start = col_start + deltaStartChar
-        _add_highlight(bufnr, ns_id, line, col_start, length,
-            M.__semantic_to_hl_group(tokenType, tokenModifiers, legend.tokenTypes, legend.tokenModifiers),
-            offset_encoding)
+
+        local token_type = legend.tokenTypes[tokenType + 1]
+        local token_modifiers = token_modifiers_parse(tokenModifiers, legend.tokenModifiers)
+        local col_end = col_start + length
+        local line_str = api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1]
+        col_start = col_start and __safe_str_byteindex_enc(line_str, col_start, offset_encoding)
+        col_end = col_end and __safe_str_byteindex_enc(line_str, col_end, offset_encoding)
+        local text = string.sub(line_str, col_start + 1, col_end)
+
+        ext_mark_userdata_dict[
+            api.nvim_buf_set_extmark(
+                bufnr,
+                ns_id,
+                line,
+                col_start,
+                {
+                    end_col = col_end,
+                    hl_group = M.__semantic_to_hl_group(token_type, token_modifiers),
+                    priority = config.priority,
+                })] = {
+            text = text,
+            source = client.name,
+            tokenType = token_type,
+            tokenModifiers = token_modifiers,
+        }
     end
 
     api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
     for i = 1, #data, 5 do
         pcall(parse_and_add_highlight, data[i], data[i + 1], data[i + 2], data[i + 3], data[i + 4])
     end
+    extmark_userdata[bufnr][ns_id] = ext_mark_userdata_dict
 end
 
 ---@private
@@ -191,10 +198,12 @@ function M._on_semantic(semantic, bufnr, client, legend)
     if not semantic_by_client then
         semantic_by_client = { [client_id] = semantic }
         semantic_cache_by_buf[bufnr] = semantic_by_client
+        extmark_userdata[bufnr] = { [namespaces[client_id]] = {} }
 
         api.nvim_buf_attach(bufnr, false, {
             on_detach = function(b)
                 semantic_cache_by_buf[b] = nil
+                extmark_userdata[b] = nil
             end,
             on_lines = function(_, b, changedtick)
                 M.refresh_buf_client_defer(client, b, changedtick)
@@ -222,7 +231,7 @@ function M._on_semantic(semantic, bufnr, client, legend)
     end
 
     if semantic_info then
-        M._on_semantic_parse(semantic_info.data, legend, bufnr, client_id, client.offset_encoding)
+        M._on_semantic_parse(semantic_info.data, legend, bufnr, client)
     end
 end
 
@@ -289,7 +298,6 @@ function M.refresh()
 end
 
 function M.setup(opt)
-
     if not opt then
         return
     end
@@ -312,9 +320,10 @@ function M.show()
     local start = api.nvim_win_get_cursor(0)
     local cur_lnum = start[1] - 1
     local cur_col = start[2]
-    local result = { "# Semantic" }
+    local result = { "# Semantic", '---', }
 
     for _, ns in pairs(namespaces) do
+        local ext_mark_userdata_dict = extmark_userdata[bufnr][ns]
         local ext_mark = api.nvim_buf_get_extmarks(
             bufnr,
             ns,
@@ -322,18 +331,23 @@ function M.show()
             { 0, 0 },
             { limit = 1, details = true }
         )[1]
+
         if ext_mark then
-            print(vim.inspect(ext_mark))
             local m_lnum = ext_mark[2]
             local m_col_start = ext_mark[3]
             local m_col_end = ext_mark[4].end_col
             if cur_lnum == m_lnum and cur_col >= m_col_start and cur_col < m_col_end then
-                table.insert(result, "* " .. ext_mark[4].hl_group)
+                local m_userdata = ext_mark_userdata_dict[ext_mark[1]]
+                table.insert(result, string.format("source:         %s", m_userdata.source))
+                table.insert(result, string.format("text:           %s", m_userdata.text))
+                table.insert(result, string.format("hlGroup:        %s", ext_mark[4].hl_group))
+                table.insert(result, string.format("tokenType:      %s", m_userdata.tokenType))
+                table.insert(result, string.format("tokenModifiers: %s", table.concat(m_userdata.tokenModifiers, ", ")))
             end
         end
     end
 
-    if #result > 1 then
+    if #result > 2 then
         vim.lsp.util.open_floating_preview(
             result,
             "markdown",
