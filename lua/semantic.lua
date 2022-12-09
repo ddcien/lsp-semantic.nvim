@@ -218,15 +218,16 @@ function M._on_semantic(semantic, bufnr, client, legend)
             semantic_by_client[client_id] = semantic
             semantic_info = semantic
         else
-            local old = semantic_by_client[client_id]
             local edits = semantic.edits
-
-            table.sort(edits, function(a, b) return a.start > b.start end)
-            for _, e in pairs(edits) do
-                on_semantic_apply_edit(old.data, e)
+            if not vim.tbl_isempty(edits) then
+                local old = semantic_by_client[client_id]
+                table.sort(edits, function(a, b) return a.start > b.start end)
+                for _, e in pairs(edits) do
+                    on_semantic_apply_edit(old.data, e)
+                end
+                old.resultId = semantic.resultId
+                semantic_info = old
             end
-            old.resultId = semantic.resultId
-            semantic_info = old
         end
     end
 
@@ -250,16 +251,12 @@ end
 
 ---@private
 function M.__refresh_buf_client(client, bufnr)
+    bufnr = bufnr or api.nvim_get_current_buf()
     local client_id = client.id
     if active_refreshes[client_id] then
         return
     end
     active_refreshes[client_id] = true
-
-    local method = 'textDocument/semanticTokens/full'
-    local params = {
-        textDocument = util.make_text_document_params(),
-    }
 
     local semantic_tokens_provider = client.server_capabilities.semanticTokensProvider
     if not semantic_tokens_provider then
@@ -269,8 +266,13 @@ function M.__refresh_buf_client(client, bufnr)
         return
     end
 
+    local method = 'textDocument/semanticTokens/full'
+    local params = {
+        textDocument = util.make_text_document_params(),
+    }
+
     if type(semantic_tokens_provider.full) == "table" and semantic_tokens_provider.full.delta then
-        local semantic_by_client = semantic_cache_by_buf[bufnr or api.nvim_get_current_buf()]
+        local semantic_by_client = semantic_cache_by_buf[bufnr]
         if semantic_by_client then
             local semantic = semantic_by_client[client_id]
             if semantic and semantic.resultId then
